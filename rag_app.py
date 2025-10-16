@@ -22,8 +22,7 @@ from langchain_community.document_loaders import (
     TextLoader,
     Docx2txtLoader
 )
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.llms import Ollama
+
 from langchain.prompts import PromptTemplate
 
 # Initialize FastAPI app
@@ -145,9 +144,15 @@ def get_embeddings():
     """Get or create embeddings instance"""
     global embeddings
     if embeddings is None:
-        embeddings = OllamaEmbeddings(
-            model=current_config["embedding_model"]
-        )
+        try:
+            print(f"Creating embeddings with model: {current_config['embedding_model']}")
+            embeddings = OllamaEmbeddings(
+                model=current_config["embedding_model"]
+            )
+            print("Embeddings model created successfully")
+        except Exception as e:
+            print(f"Failed to create embeddings: {str(e)}")
+            raise Exception(f"Could not initialize Ollama embeddings. Is Ollama running? Error: {str(e)}")
     return embeddings
 
 def load_document(file_path: str):
@@ -172,34 +177,49 @@ def process_document(file_path: str, filename: str):
     """Process document: load, split, embed, and store"""
     global vector_store
     
-    # Load document
-    documents = load_document(file_path)
-    
-    # Split into chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=current_config["chunk_size"],
-        chunk_overlap=current_config["chunk_overlap"],
-        length_function=len
-    )
-    chunks = text_splitter.split_documents(documents)
-    
-    # Add metadata
-    for chunk in chunks:
-        chunk.metadata["source"] = filename
-    
-    # Generate embeddings
-    embeddings_model = get_embeddings()
-    texts = [chunk.page_content for chunk in chunks]
-    chunk_embeddings = embeddings_model.embed_documents(texts)
-    
-    # Add to vector store
-    vector_store.add_documents(chunks, chunk_embeddings)
-    vector_store.save()
-    
-    # Update metadata
-    document_metadata[filename] = len(chunks)
-    
-    return len(chunks)
+    try:
+        print(f"Loading document: {file_path}")
+        # Load document
+        documents = load_document(file_path)
+        print(f"Document loaded: {len(documents)} pages/sections")
+        
+        # Split into chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=current_config["chunk_size"],
+            chunk_overlap=current_config["chunk_overlap"],
+            length_function=len
+        )
+        chunks = text_splitter.split_documents(documents)
+        print(f"Split into {len(chunks)} chunks")
+        
+        # Add metadata
+        for chunk in chunks:
+            chunk.metadata["source"] = filename
+        
+        # Generate embeddings
+        print("Getting embeddings model...")
+        embeddings_model = get_embeddings()
+        
+        print("Generating embeddings...")
+        texts = [chunk.page_content for chunk in chunks]
+        chunk_embeddings = embeddings_model.embed_documents(texts)
+        print(f"Generated {len(chunk_embeddings)} embeddings")
+        
+        # Add to vector store
+        print("Adding to vector store...")
+        vector_store.add_documents(chunks, chunk_embeddings)
+        vector_store.save()
+        print("Vector store saved")
+        
+        # Update metadata
+        document_metadata[filename] = len(chunks)
+        
+        return len(chunks)
+    except Exception as e:
+        print(f"Error in process_document: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 # API Endpoints
 
@@ -214,10 +234,21 @@ async def root():
 
 @app.get("/health")
 async def health_check():
+    # Check Ollama connection
+    ollama_status = "unknown"
+    try:
+        import requests
+        response = requests.get("http://localhost:11434/api/tags", timeout=2)
+        ollama_status = "connected" if response.status_code == 200 else "error"
+    except:
+        ollama_status = "not running"
+    
     return {
         "status": "healthy",
         "vector_db": "SimpleVectorStore",
-        "documents_indexed": vector_store.get_count()
+        "documents_indexed": vector_store.get_count(),
+        "ollama_status": ollama_status,
+        "embedding_model": current_config["embedding_model"]
     }
 
 @app.get("/models")
@@ -251,10 +282,31 @@ async def get_available_models():
             "error": str(e)
         }
 
+@app.get("/test-embeddings")
+async def test_embeddings():
+    """Test if embeddings are working"""
+    try:
+        emb = get_embeddings()
+        test_embedding = emb.embed_query("test")
+        return {
+            "status": "success",
+            "embedding_dim": len(test_embedding),
+            "message": "Embeddings working correctly"
+        }
+    except Exception as e:
+        import traceback
+        return {
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
     """Upload and process a document"""
     try:
+        print(f"Received file: {file.filename}")
+        
         # Validate file type
         allowed_extensions = ['.pdf', '.txt', '.docx', '.doc']
         file_ext = Path(file.filename).suffix.lower()
@@ -267,11 +319,17 @@ async def upload_document(file: UploadFile = File(...)):
         
         # Save uploaded file
         file_path = UPLOAD_DIR / file.filename
+        print(f"Saving to: {file_path}")
+        
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
+        print(f"File saved, starting processing...")
+        
         # Process document
         num_chunks = process_document(str(file_path), file.filename)
+        
+        print(f"Processing complete: {num_chunks} chunks")
         
         return {
             "status": "success",
@@ -280,8 +338,13 @@ async def upload_document(file: UploadFile = File(...)):
             "message": f"Document processed successfully with {num_chunks} chunks"
         }
     
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"Error during upload: {error_detail}")
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n\nFull trace:\n{error_detail}")
 
 @app.post("/query", response_model=QueryResponse)
 async def query_documents(request: QueryRequest):
