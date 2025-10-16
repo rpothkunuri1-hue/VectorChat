@@ -1,19 +1,29 @@
-# rag_app_simple.py - RAG Application without FAISS/ChromaDB
+# rag_app.py - Enhanced RAG Application Backend
 """
-Simplified RAG Application using in-memory vector storage
-NO BUILD DEPENDENCIES REQUIRED - Pure Python
-Requires: pip install fastapi uvicorn langchain langchain-community pypdf python-docx python-multipart ollama docx2txt numpy scikit-learn
+Enhanced RAG Application with improved error handling, logging, and features
+Requires: pip install fastapi uvicorn langchain langchain-community pypdf python-docx 
+          python-multipart ollama docx2txt numpy scikit-learn
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
 import shutil
 import json
 from pathlib import Path
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+from datetime import datetime
+import logging
+from contextlib import asynccontextmanager
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # LangChain imports
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -22,11 +32,252 @@ from langchain_community.document_loaders import (
     TextLoader,
     Docx2txtLoader
 )
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.llms import Ollama
+from langchain.schema import Document
 
-from langchain.prompts import PromptTemplate
+# Global variables
+UPLOAD_DIR = Path("./uploaded_documents")
+DATA_DIR = Path("./vector_data")
+METADATA_FILE = DATA_DIR / "metadata.json"
+
+UPLOAD_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(exist_ok=True)
+
+# Configuration
+class AppConfig:
+    def __init__(self):
+        self.model = "llama3"
+        self.embedding_model = "nomic-embed-text"
+        self.chunk_size = 1000
+        self.chunk_overlap = 200
+        self.temperature = 0.7
+        
+    def to_dict(self):
+        return {
+            "model": self.model,
+            "embedding_model": self.embedding_model,
+            "chunk_size": self.chunk_size,
+            "chunk_overlap": self.chunk_overlap,
+            "temperature": self.temperature
+        }
+
+config = AppConfig()
+
+# Enhanced Vector Store
+class SimpleVectorStore:
+    def __init__(self):
+        self.embeddings_list = []
+        self.documents = []
+        self.metadata = []
+        self.stats = {
+            "total_chunks": 0,
+            "total_queries": 0,
+            "last_updated": None
+        }
+        
+    def add_documents(self, docs: List[Document], embeddings: List[np.ndarray]):
+        """Add documents with their embeddings"""
+        self.documents.extend(docs)
+        self.embeddings_list.extend(embeddings)
+        self.metadata.extend([doc.metadata for doc in docs])
+        self.stats["total_chunks"] = len(self.documents)
+        self.stats["last_updated"] = datetime.now().isoformat()
+        
+    def similarity_search(self, query_embedding: np.ndarray, k: int = 4) -> List[Document]:
+        """Find most similar documents"""
+        if not self.embeddings_list:
+            return []
+        
+        similarities = cosine_similarity(
+            [query_embedding],
+            self.embeddings_list
+        )[0]
+        
+        top_indices = np.argsort(similarities)[-k:][::-1]
+        
+        results = []
+        for i in top_indices:
+            doc = self.documents[i]
+            doc.metadata["similarity_score"] = float(similarities[i])
+            results.append(doc)
+        
+        self.stats["total_queries"] += 1
+        return results
+    
+    def get_count(self) -> int:
+        return len(self.documents)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        return self.stats.copy()
+    
+    def get_documents_by_source(self, source: str) -> List[Document]:
+        """Get all documents from a specific source"""
+        return [doc for doc in self.documents if doc.metadata.get("source") == source]
+    
+    def save(self):
+        """Save to disk"""
+        try:
+            data = {
+                'embeddings': [emb.tolist() for emb in self.embeddings_list],
+                'documents': [
+                    {
+                        'page_content': doc.page_content, 
+                        'metadata': doc.metadata
+                    } 
+                    for doc in self.documents
+                ],
+                'metadata': self.metadata,
+                'stats': self.stats
+            }
+            with open(DATA_DIR / 'vectors.json', 'w') as f:
+                json.dump(data, f, indent=2)
+            logger.info(f"Saved {len(self.documents)} documents to disk")
+        except Exception as e:
+            logger.error(f"Error saving vector store: {e}")
+            raise
+    
+    def load(self) -> bool:
+        """Load from disk"""
+        try:
+            vector_file = DATA_DIR / 'vectors.json'
+            if not vector_file.exists():
+                return False
+                
+            with open(vector_file, 'r') as f:
+                data = json.load(f)
+            
+            self.embeddings_list = [np.array(emb) for emb in data['embeddings']]
+            self.documents = [
+                Document(page_content=doc['page_content'], metadata=doc['metadata'])
+                for doc in data['documents']
+            ]
+            self.metadata = data['metadata']
+            self.stats = data.get('stats', self.stats)
+            
+            logger.info(f"Loaded {len(self.documents)} documents from disk")
+            return True
+        except Exception as e:
+            logger.error(f"Error loading vector store: {e}")
+            return False
+    
+    def clear(self):
+        """Clear all data"""
+        self.embeddings_list = []
+        self.documents = []
+        self.metadata = []
+        self.stats = {
+            "total_chunks": 0,
+            "total_queries": 0,
+            "last_updated": None
+        }
+
+# Document Metadata Manager
+class DocumentMetadataManager:
+    def __init__(self):
+        self.metadata = {}
+        self.load()
+    
+    def add_document(self, filename: str, chunks: int, file_size: int, file_type: str):
+        self.metadata[filename] = {
+            "chunks": chunks,
+            "size": file_size,
+            "type": file_type,
+            "uploaded_at": datetime.now().isoformat(),
+            "status": "indexed"
+        }
+        self.save()
+    
+    def remove_document(self, filename: str):
+        if filename in self.metadata:
+            del self.metadata[filename]
+            self.save()
+    
+    def get_document(self, filename: str) -> Optional[Dict]:
+        return self.metadata.get(filename)
+    
+    def get_all(self) -> Dict:
+        return self.metadata.copy()
+    
+    def clear(self):
+        self.metadata = {}
+        self.save()
+    
+    def save(self):
+        try:
+            with open(METADATA_FILE, 'w') as f:
+                json.dump(self.metadata, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving metadata: {e}")
+    
+    def load(self):
+        try:
+            if METADATA_FILE.exists():
+                with open(METADATA_FILE, 'r') as f:
+                    self.metadata = json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading metadata: {e}")
+            self.metadata = {}
+
+# Global instances
+vector_store = SimpleVectorStore()
+doc_metadata = DocumentMetadataManager()
+embeddings_cache = None
+
+# Pydantic models
+class QueryRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
+    model: Optional[str] = None
+    top_k: int = Field(default=4, ge=1, le=10)
+    temperature: Optional[float] = Field(default=None, ge=0, le=1)
+
+class QueryResponse(BaseModel):
+    answer: str
+    sources: List[str]
+    chunks_used: int
+    similarity_scores: List[float]
+    processing_time: float
+
+class DocumentUploadResponse(BaseModel):
+    status: str
+    filename: str
+    chunks: int
+    file_size: int
+    message: str
+
+class ModelConfig(BaseModel):
+    model: str
+    embedding_model: Optional[str] = None
+    chunk_size: Optional[int] = Field(default=None, ge=100, le=5000)
+    chunk_overlap: Optional[int] = Field(default=None, ge=0, le=1000)
+    temperature: Optional[float] = Field(default=None, ge=0, le=1)
+
+class DocumentInfo(BaseModel):
+    filename: str
+    size: int
+    chunks: int
+    status: str
+    uploaded_at: str
+    type: str
+
+# Lifespan context manager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting RAG Application Server...")
+    vector_store.load()
+    logger.info(f"Loaded {vector_store.get_count()} document chunks")
+    yield
+    # Shutdown
+    logger.info("Shutting down RAG Application Server...")
 
 # Initialize FastAPI app
-app = FastAPI(title="RAG Application API - Simple")
+app = FastAPI(
+    title="RAG Application API",
+    version="2.0.0",
+    description="Enhanced RAG Application with Simple Vector Store",
+    lifespan=lifespan
+)
 
 # CORS middleware
 app.add_middleware(
@@ -37,125 +288,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables
-UPLOAD_DIR = Path("./uploaded_documents")
-DATA_DIR = Path("./vector_data")
-UPLOAD_DIR.mkdir(exist_ok=True)
-DATA_DIR.mkdir(exist_ok=True)
-
-# Current configuration
-current_config = {
-    "model": "llama3",
-    "embedding_model": "nomic-embed-text",
-    "chunk_size": 1000,
-    "chunk_overlap": 200
-}
-
-# In-memory vector store
-class SimpleVectorStore:
-    def __init__(self):
-        self.embeddings_list = []
-        self.documents = []
-        self.metadata = []
-        
-    def add_documents(self, docs, embeddings):
-        """Add documents with their embeddings"""
-        self.documents.extend(docs)
-        self.embeddings_list.extend(embeddings)
-        self.metadata.extend([doc.metadata for doc in docs])
-        
-    def similarity_search(self, query_embedding, k=4):
-        """Find most similar documents"""
-        if not self.embeddings_list:
-            return []
-        
-        # Calculate cosine similarity
-        similarities = cosine_similarity(
-            [query_embedding],
-            self.embeddings_list
-        )[0]
-        
-        # Get top k indices
-        top_indices = np.argsort(similarities)[-k:][::-1]
-        
-        # Return documents
-        return [self.documents[i] for i in top_indices]
-    
-    def get_count(self):
-        """Get number of documents"""
-        return len(self.documents)
-    
-    def save(self):
-        """Save to disk"""
-        data = {
-            'embeddings': [emb.tolist() for emb in self.embeddings_list],
-            'documents': [{'page_content': doc.page_content, 'metadata': doc.metadata} 
-                         for doc in self.documents],
-            'metadata': self.metadata
-        }
-        with open(DATA_DIR / 'vectors.json', 'w') as f:
-            json.dump(data, f)
-    
-    def load(self):
-        """Load from disk"""
-        try:
-            with open(DATA_DIR / 'vectors.json', 'r') as f:
-                data = json.load(f)
-            
-            from langchain.docstore.document import Document
-            self.embeddings_list = [np.array(emb) for emb in data['embeddings']]
-            self.documents = [
-                Document(page_content=doc['page_content'], metadata=doc['metadata'])
-                for doc in data['documents']
-            ]
-            self.metadata = data['metadata']
-            return True
-        except:
-            return False
-    
-    def clear(self):
-        """Clear all data"""
-        self.embeddings_list = []
-        self.documents = []
-        self.metadata = []
-
-# Global instances
-vector_store = SimpleVectorStore()
-embeddings = None
-document_metadata = {}
-
-# Pydantic models
-class QueryRequest(BaseModel):
-    question: str
-    model: Optional[str] = None
-    top_k: int = 4
-
-class QueryResponse(BaseModel):
-    answer: str
-    sources: List[str]
-    chunks_used: int
-
-class ModelConfig(BaseModel):
-    model: str
-    embedding_model: Optional[str] = None
-
 # Helper functions
 def get_embeddings():
     """Get or create embeddings instance"""
-    global embeddings
-    if embeddings is None:
+    global embeddings_cache
+    if embeddings_cache is None:
         try:
-            print(f"Creating embeddings with model: {current_config['embedding_model']}")
-            embeddings = OllamaEmbeddings(
-                model=current_config["embedding_model"]
+            embeddings_cache = OllamaEmbeddings(
+                model=config.embedding_model
             )
-            print("Embeddings model created successfully")
+            logger.info(f"Initialized embeddings with model: {config.embedding_model}")
         except Exception as e:
-            print(f"Failed to create embeddings: {str(e)}")
-            raise Exception(f"Could not initialize Ollama embeddings. Is Ollama running? Error: {str(e)}")
-    return embeddings
+            logger.error(f"Error initializing embeddings: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to initialize embeddings: {str(e)}")
+    return embeddings_cache
 
-def load_document(file_path: str):
+def load_document(file_path: str) -> List[Document]:
     """Load document based on file extension"""
     ext = Path(file_path).suffix.lower()
     
@@ -169,56 +317,40 @@ def load_document(file_path: str):
         else:
             raise ValueError(f"Unsupported file type: {ext}")
         
-        return loader.load()
+        documents = loader.load()
+        logger.info(f"Loaded {len(documents)} pages from {file_path}")
+        return documents
     except Exception as e:
+        logger.error(f"Failed to load document {file_path}: {e}")
         raise ValueError(f"Failed to load document: {str(e)}")
 
-def process_document(file_path: str, filename: str):
+def process_document(file_path: str, filename: str) -> int:
     """Process document: load, split, embed, and store"""
-    global vector_store
-    
     try:
-        print(f"Loading document: {file_path}")
-        # Load document
         documents = load_document(file_path)
-        print(f"Document loaded: {len(documents)} pages/sections")
         
-        # Split into chunks
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=current_config["chunk_size"],
-            chunk_overlap=current_config["chunk_overlap"],
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
             length_function=len
         )
         chunks = text_splitter.split_documents(documents)
-        print(f"Split into {len(chunks)} chunks")
         
-        # Add metadata
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
             chunk.metadata["source"] = filename
+            chunk.metadata["chunk_id"] = i
         
-        # Generate embeddings
-        print("Getting embeddings model...")
         embeddings_model = get_embeddings()
-        
-        print("Generating embeddings...")
         texts = [chunk.page_content for chunk in chunks]
         chunk_embeddings = embeddings_model.embed_documents(texts)
-        print(f"Generated {len(chunk_embeddings)} embeddings")
         
-        # Add to vector store
-        print("Adding to vector store...")
         vector_store.add_documents(chunks, chunk_embeddings)
         vector_store.save()
-        print("Vector store saved")
         
-        # Update metadata
-        document_metadata[filename] = len(chunks)
-        
+        logger.info(f"Processed {filename}: {len(chunks)} chunks created")
         return len(chunks)
     except Exception as e:
-        print(f"Error in process_document: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Error processing document {filename}: {e}")
         raise
 
 # API Endpoints
@@ -226,29 +358,23 @@ def process_document(file_path: str, filename: str):
 @app.get("/")
 async def root():
     return {
-        "message": "RAG Application API - Simple Vector Store",
-        "version": "1.0.0",
+        "message": "RAG Application API - Enhanced Version",
+        "version": "2.0.0",
         "status": "running",
-        "database": "In-Memory + File Storage"
+        "database": "In-Memory + File Storage",
+        "docs": "/docs"
     }
 
 @app.get("/health")
 async def health_check():
-    # Check Ollama connection
-    ollama_status = "unknown"
-    try:
-        import requests
-        response = requests.get("http://localhost:11434/api/tags", timeout=2)
-        ollama_status = "connected" if response.status_code == 200 else "error"
-    except:
-        ollama_status = "not running"
-    
+    stats = vector_store.get_stats()
     return {
         "status": "healthy",
         "vector_db": "SimpleVectorStore",
         "documents_indexed": vector_store.get_count(),
-        "ollama_status": ollama_status,
-        "embedding_model": current_config["embedding_model"]
+        "total_queries": stats.get("total_queries", 0),
+        "last_updated": stats.get("last_updated"),
+        "config": config.to_dict()
     }
 
 @app.get("/models")
@@ -259,7 +385,8 @@ async def get_available_models():
         result = subprocess.run(
             ["ollama", "list"], 
             capture_output=True, 
-            text=True
+            text=True,
+            timeout=5
         )
         
         if result.returncode == 0:
@@ -269,45 +396,27 @@ async def get_available_models():
                 if line.strip():
                     model_name = line.split()[0]
                     models.append(model_name)
-            return {"models": models, "current": current_config["model"]}
+            return {
+                "models": models if models else ["llama3", "mistral", "phi"],
+                "current": config.model
+            }
         else:
             return {
                 "models": ["llama3", "mistral", "phi", "gemma"],
-                "current": current_config["model"]
+                "current": config.model
             }
     except Exception as e:
+        logger.error(f"Error fetching models: {e}")
         return {
             "models": ["llama3", "mistral", "phi", "gemma"],
-            "current": current_config["model"],
+            "current": config.model,
             "error": str(e)
         }
 
-@app.get("/test-embeddings")
-async def test_embeddings():
-    """Test if embeddings are working"""
-    try:
-        emb = get_embeddings()
-        test_embedding = emb.embed_query("test")
-        return {
-            "status": "success",
-            "embedding_dim": len(test_embedding),
-            "message": "Embeddings working correctly"
-        }
-    except Exception as e:
-        import traceback
-        return {
-            "status": "error",
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
-
-@app.post("/upload")
+@app.post("/upload", response_model=DocumentUploadResponse)
 async def upload_document(file: UploadFile = File(...)):
     """Upload and process a document"""
     try:
-        print(f"Received file: {file.filename}")
-        
-        # Validate file type
         allowed_extensions = ['.pdf', '.txt', '.docx', '.doc']
         file_ext = Path(file.filename).suffix.lower()
         
@@ -317,38 +426,54 @@ async def upload_document(file: UploadFile = File(...)):
                 detail=f"File type not supported. Allowed: {', '.join(allowed_extensions)}"
             )
         
-        # Save uploaded file
         file_path = UPLOAD_DIR / file.filename
-        print(f"Saving to: {file_path}")
         
+        # Check if file already exists
+        if file_path.exists():
+            raise HTTPException(
+                status_code=400,
+                detail=f"File '{file.filename}' already exists. Please delete it first or rename the file."
+            )
+        
+        # Save file
         with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        print(f"File saved, starting processing...")
+            content = await file.read()
+            buffer.write(content)
+            file_size = len(content)
         
         # Process document
         num_chunks = process_document(str(file_path), file.filename)
         
-        print(f"Processing complete: {num_chunks} chunks")
+        # Update metadata
+        doc_metadata.add_document(
+            filename=file.filename,
+            chunks=num_chunks,
+            file_size=file_size,
+            file_type=file_ext
+        )
         
-        return {
-            "status": "success",
-            "filename": file.filename,
-            "chunks": num_chunks,
-            "message": f"Document processed successfully with {num_chunks} chunks"
-        }
+        return DocumentUploadResponse(
+            status="success",
+            filename=file.filename,
+            chunks=num_chunks,
+            file_size=file_size,
+            message=f"Document processed successfully with {num_chunks} chunks"
+        )
     
-    except HTTPException as he:
-        raise he
+    except HTTPException:
+        raise
     except Exception as e:
-        import traceback
-        error_detail = traceback.format_exc()
-        print(f"Error during upload: {error_detail}")
-        raise HTTPException(status_code=500, detail=f"{str(e)}\n\nFull trace:\n{error_detail}")
+        logger.error(f"Upload error: {e}")
+        # Clean up file if it was created
+        if file_path.exists():
+            file_path.unlink()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/query", response_model=QueryResponse)
 async def query_documents(request: QueryRequest):
     """Query the RAG system"""
+    start_time = datetime.now()
+    
     try:
         if vector_store.get_count() == 0:
             raise HTTPException(
@@ -356,14 +481,12 @@ async def query_documents(request: QueryRequest):
                 detail="No documents indexed. Please upload documents first."
             )
         
-        # Set model
-        model_name = request.model or current_config["model"]
+        model_name = request.model or config.model
+        temperature = request.temperature if request.temperature is not None else config.temperature
         
-        # Get query embedding
         embeddings_model = get_embeddings()
         query_embedding = embeddings_model.embed_query(request.question)
         
-        # Search for similar documents
         similar_docs = vector_store.similarity_search(query_embedding, k=request.top_k)
         
         if not similar_docs:
@@ -372,15 +495,16 @@ async def query_documents(request: QueryRequest):
                 detail="No relevant documents found"
             )
         
-        # Create context from documents
-        context = "\n\n".join([doc.page_content for doc in similar_docs])
+        context = "\n\n".join([
+            f"[Source: {doc.metadata.get('source', 'Unknown')}]\n{doc.page_content}"
+            for doc in similar_docs
+        ])
         
-        # Create LLM
-        llm = Ollama(model=model_name, temperature=0.7)
+        llm = Ollama(model=model_name, temperature=temperature)
         
-        # Create prompt
         prompt_template = """Use the following pieces of context to answer the question at the end. 
-If you don't know the answer, just say that you don't know, don't try to make up an answer.
+If you don't know the answer based on the context, just say that you don't know, don't try to make up an answer.
+Provide a clear, concise answer based solely on the given context.
 
 Context:
 {context}
@@ -390,105 +514,192 @@ Question: {question}
 Answer: """
         
         prompt = prompt_template.format(context=context, question=request.question)
-        
-        # Get answer
         answer = llm.invoke(prompt)
         
-        # Extract sources
         sources = list(set([
             doc.metadata.get("source", "Unknown")
             for doc in similar_docs
         ]))
         
+        similarity_scores = [
+            doc.metadata.get("similarity_score", 0.0)
+            for doc in similar_docs
+        ]
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        logger.info(f"Query processed in {processing_time:.2f}s - Question: {request.question[:50]}...")
+        
         return QueryResponse(
             answer=answer,
             sources=sources,
-            chunks_used=len(similar_docs)
+            chunks_used=len(similar_docs),
+            similarity_scores=similarity_scores,
+            processing_time=processing_time
         )
     
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Query error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/configure")
-async def configure_model(config: ModelConfig):
+async def configure_model(new_config: ModelConfig):
     """Configure the RAG system"""
-    global current_config, embeddings
+    global embeddings_cache
     
-    current_config["model"] = config.model
-    
-    if config.embedding_model:
-        current_config["embedding_model"] = config.embedding_model
-        embeddings = None
-    
-    return {
-        "status": "success",
-        "config": current_config
-    }
+    try:
+        config.model = new_config.model
+        
+        if new_config.embedding_model:
+            config.embedding_model = new_config.embedding_model
+            embeddings_cache = None
+        
+        if new_config.chunk_size:
+            config.chunk_size = new_config.chunk_size
+        
+        if new_config.chunk_overlap:
+            config.chunk_overlap = new_config.chunk_overlap
+        
+        if new_config.temperature is not None:
+            config.temperature = new_config.temperature
+        
+        logger.info(f"Configuration updated: {config.to_dict()}")
+        
+        return {
+            "status": "success",
+            "config": config.to_dict()
+        }
+    except Exception as e:
+        logger.error(f"Configuration error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/documents")
+@app.get("/documents", response_model=Dict[str, List[DocumentInfo]])
 async def list_documents():
     """List all uploaded documents"""
     documents = []
-    for filename, chunks in document_metadata.items():
+    all_metadata = doc_metadata.get_all()
+    
+    for filename, meta in all_metadata.items():
         file_path = UPLOAD_DIR / filename
         if file_path.exists():
-            documents.append({
-                "filename": filename,
-                "size": file_path.stat().st_size,
-                "chunks": chunks,
-                "status": "indexed"
-            })
+            documents.append(DocumentInfo(
+                filename=filename,
+                size=meta.get("size", 0),
+                chunks=meta.get("chunks", 0),
+                status=meta.get("status", "unknown"),
+                uploaded_at=meta.get("uploaded_at", ""),
+                type=meta.get("type", "")
+            ))
+    
     return {"documents": documents}
+
+@app.get("/documents/{filename}/preview")
+async def preview_document(filename: str, max_chunks: int = 3):
+    """Preview document chunks"""
+    try:
+        chunks = vector_store.get_documents_by_source(filename)
+        
+        if not chunks:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        preview_chunks = chunks[:max_chunks]
+        
+        return {
+            "filename": filename,
+            "total_chunks": len(chunks),
+            "preview": [
+                {
+                    "chunk_id": chunk.metadata.get("chunk_id", i),
+                    "content": chunk.page_content[:500] + "..." if len(chunk.page_content) > 500 else chunk.page_content,
+                    "length": len(chunk.page_content)
+                }
+                for i, chunk in enumerate(preview_chunks)
+            ]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Preview error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/documents/{filename}")
 async def delete_document(filename: str):
     """Delete a document"""
-    file_path = UPLOAD_DIR / filename
-    
-    if file_path.exists():
+    try:
+        file_path = UPLOAD_DIR / filename
+        
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="Document not found")
+        
         file_path.unlink()
-        if filename in document_metadata:
-            del document_metadata[filename]
+        doc_metadata.remove_document(filename)
+        
+        logger.info(f"Deleted document: {filename}")
         
         return {
             "status": "success",
-            "message": f"Document {filename} deleted",
-            "note": "Vector store rebuild recommended"
+            "message": f"Document '{filename}' deleted successfully",
+            "note": "Vector store rebuild recommended for complete removal"
         }
-    else:
-        raise HTTPException(status_code=404, detail="Document not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Delete error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/clear")
 async def clear_all():
     """Clear all documents and vector database"""
-    global vector_store, document_metadata
+    try:
+        # Clear uploaded files
+        for file_path in UPLOAD_DIR.iterdir():
+            if file_path.is_file():
+                file_path.unlink()
+        
+        # Clear vector data
+        vector_file = DATA_DIR / 'vectors.json'
+        if vector_file.exists():
+            vector_file.unlink()
+        
+        # Reset
+        vector_store.clear()
+        doc_metadata.clear()
+        
+        logger.info("All documents and embeddings cleared")
+        
+        return {
+            "status": "success",
+            "message": "All documents and embeddings cleared successfully"
+        }
+    except Exception as e:
+        logger.error(f"Clear error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/stats")
+async def get_statistics():
+    """Get detailed statistics"""
+    stats = vector_store.get_stats()
+    all_docs = doc_metadata.get_all()
     
-    # Clear uploaded files
-    for file_path in UPLOAD_DIR.iterdir():
-        if file_path.is_file():
-            file_path.unlink()
-    
-    # Clear vector data
-    if (DATA_DIR / 'vectors.json').exists():
-        (DATA_DIR / 'vectors.json').unlink()
-    
-    # Reset
-    vector_store.clear()
-    document_metadata = {}
+    total_size = sum(doc.get("size", 0) for doc in all_docs.values())
     
     return {
-        "status": "success",
-        "message": "All documents and embeddings cleared"
+        "total_documents": len(all_docs),
+        "total_chunks": stats.get("total_chunks", 0),
+        "total_queries": stats.get("total_queries", 0),
+        "total_size_bytes": total_size,
+        "last_updated": stats.get("last_updated"),
+        "config": config.to_dict()
     }
-
-@app.on_event("startup")
-async def startup_event():
-    """Load existing data on startup"""
-    vector_store.load()
-    print(f"Loaded {vector_store.get_count()} document chunks")
 
 if __name__ == "__main__":
     import uvicorn
-    print("Starting RAG Application Server (Simple Vector Store)...")
-    print("API Documentation: http://localhost:8000/docs")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print("=" * 60)
+    print("Starting Enhanced RAG Application Server...")
+    print("=" * 60)
+    print(f"API Documentation: http://localhost:8000/docs")
+    print(f"Health Check: http://localhost:8000/health")
+    print("=" * 60)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
