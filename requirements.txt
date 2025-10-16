@@ -1,0 +1,34 @@
+# requirements.txt - RAG Application (Python 3.13 - NO BUILD TOOLS NEEDED)
+
+# Core Framework
+fastapi
+uvicorn[standard]
+python-multipart
+
+# LangChain
+langchain
+langchain-community
+
+# Document Processing
+pypdf
+python-docx
+docx2txt
+
+# Ollama Integration
+ollama
+
+# Vector Operations (Pure Python - No Build Required)
+numpy
+scikit-learn
+
+# HTTP Client
+requests
+
+# Utilities
+pydantic
+
+# ============================================
+# OPTIONAL: Streamlit UI
+# If you want Streamlit UI, install separately:
+# pip install streamlit
+# ============================================
