@@ -94,17 +94,32 @@ class SimpleVectorStore:
         """Add documents with their embeddings"""
         logger.debug(f"Adding {len(docs)} documents with {len(embeddings)} embeddings")
         
-        # FIXED: Convert embeddings to numpy arrays properly
+        # FIXED: Convert embeddings to numpy arrays with dimension validation
         try:
+            new_embeddings = []
             for i, emb in enumerate(embeddings):
                 if isinstance(emb, list):
-                    self.embeddings_list.append(np.array(emb, dtype=np.float32))
+                    new_emb = np.array(emb, dtype=np.float32)
                 elif isinstance(emb, np.ndarray):
-                    self.embeddings_list.append(emb.astype(np.float32))
+                    new_emb = emb.astype(np.float32)
                 else:
                     logger.error(f"Unexpected embedding type at index {i}: {type(emb)}")
                     raise ValueError(f"Invalid embedding type: {type(emb)}")
+                
+                # Check dimension consistency
+                if self.embeddings_list and len(new_emb) != len(self.embeddings_list[0]):
+                    logger.error(f"Embedding dimension mismatch at index {i}!")
+                    logger.error(f"Expected dimension: {len(self.embeddings_list[0])}, Got: {len(new_emb)}")
+                    logger.error(f"Current embedding model: {config.embedding_model}")
+                    raise ValueError(
+                        f"Embedding dimension mismatch! Expected {len(self.embeddings_list[0])}, got {len(new_emb)}. "
+                        f"This usually means documents were embedded with different models. "
+                        f"Please clear all documents and re-upload them with the current embedding model."
+                    )
+                
+                new_embeddings.append(new_emb)
             
+            self.embeddings_list.extend(new_embeddings)
             self.documents.extend(docs)
             self.metadata.extend([doc.metadata for doc in docs])
             self.stats["total_chunks"] = len(self.documents)
@@ -216,6 +231,18 @@ class SimpleVectorStore:
             ]
             self.metadata = data['metadata']
             self.stats = data.get('stats', self.stats)
+            
+            # Validate embedding dimensions
+            if self.embeddings_list:
+                dimensions = [len(emb) for emb in self.embeddings_list]
+                unique_dims = set(dimensions)
+                if len(unique_dims) > 1:
+                    logger.error(f"Loaded vector store has inconsistent embedding dimensions: {unique_dims}")
+                    logger.error("This indicates documents were embedded with different models.")
+                    logger.error("Clearing corrupted vector store...")
+                    self.clear()
+                    return False
+                logger.info(f"Loaded embeddings with dimension: {dimensions[0]}")
             
             logger.info(f"Loaded {len(self.documents)} documents from disk")
             return True
@@ -763,15 +790,18 @@ async def configure_model(new_config: ModelConfig):
     
     try:
         old_config = config.to_dict()
+        embedding_model_changed = False
         
         config.model = new_config.model
         logger.debug(f"Model updated: {new_config.model}")
         
         if new_config.embedding_model:
             if new_config.embedding_model != config.embedding_model:
-                logger.info(f"Embedding model changed from {config.embedding_model} to {new_config.embedding_model}")
+                logger.warning(f"Embedding model changed from {config.embedding_model} to {new_config.embedding_model}")
+                logger.warning("Changing embedding model will make existing embeddings incompatible!")
                 config.embedding_model = new_config.embedding_model
                 embeddings_cache = None  # Reset cache
+                embedding_model_changed = True
         
         if new_config.chunk_size:
             logger.debug(f"Chunk size updated: {new_config.chunk_size}")
@@ -790,11 +820,16 @@ async def configure_model(new_config: ModelConfig):
         logger.debug(f"Old config: {old_config}")
         logger.debug(f"New config: {new_config_dict}")
         
-        return {
+        response = {
             "status": "success",
             "config": new_config_dict,
             "changed_fields": [k for k in new_config_dict.keys() if new_config_dict[k] != old_config.get(k)]
         }
+        
+        if embedding_model_changed:
+            response["warning"] = "Embedding model changed. Please clear all documents and re-upload to avoid dimension mismatches."
+        
+        return response
     except Exception as e:
         logger.error(f"Configuration error: {e}")
         logger.error(traceback.format_exc())
@@ -952,6 +987,86 @@ async def clear_all():
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Clear failed: {str(e)}")
 
+@app.post("/rebuild-vectors")
+async def rebuild_vectors():
+    """Rebuild vector store from existing documents with current embedding model"""
+    logger.info("Rebuild vectors request received")
+    
+    try:
+        # Get all uploaded files
+        uploaded_files = [f for f in UPLOAD_DIR.iterdir() if f.is_file()]
+        
+        if not uploaded_files:
+            logger.warning("No documents to rebuild")
+            raise HTTPException(status_code=400, detail="No documents found to rebuild")
+        
+        logger.info(f"Rebuilding vectors for {len(uploaded_files)} documents")
+        
+        # Clear existing vector store
+        logger.debug("Clearing existing vector store...")
+        vector_store.clear()
+        
+        # Clear vector file
+        vector_file = DATA_DIR / 'vectors.json'
+        if vector_file.exists():
+            vector_file.unlink()
+        
+        # Reprocess each document
+        results = []
+        errors = []
+        
+        for file_path in uploaded_files:
+            try:
+                logger.info(f"Reprocessing: {file_path.name}")
+                
+                # Get file info
+                file_size = file_path.stat().st_size
+                file_ext = file_path.suffix.lower()
+                
+                # Process document
+                num_chunks = process_document(str(file_path), file_path.name)
+                
+                # Update metadata
+                doc_metadata.add_document(
+                    filename=file_path.name,
+                    chunks=num_chunks,
+                    file_size=file_size,
+                    file_type=file_ext
+                )
+                
+                results.append({
+                    "filename": file_path.name,
+                    "chunks": num_chunks,
+                    "status": "success"
+                })
+                logger.info(f"Successfully rebuilt: {file_path.name} ({num_chunks} chunks)")
+                
+            except Exception as e:
+                logger.error(f"Failed to rebuild {file_path.name}: {e}")
+                errors.append({
+                    "filename": file_path.name,
+                    "error": str(e)
+                })
+        
+        response = {
+            "status": "success" if not errors else "partial_success",
+            "message": f"Rebuilt {len(results)} documents with current embedding model",
+            "embedding_model": config.embedding_model,
+            "successful": results,
+            "failed": errors,
+            "total_chunks": vector_store.get_count()
+        }
+        
+        logger.info(f"Rebuild complete: {len(results)} success, {len(errors)} failed")
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Rebuild error: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Rebuild failed: {str(e)}")
+
 @app.get("/stats")
 async def get_statistics():
     """Get detailed statistics"""
@@ -1026,6 +1141,14 @@ async def debug_vector_store():
     try:
         stats = vector_store.get_stats()
         
+        # Check embedding dimensions
+        embedding_dimensions = []
+        if vector_store.embeddings_list:
+            embedding_dimensions = [len(emb) for emb in vector_store.embeddings_list]
+            unique_dims = list(set(embedding_dimensions))
+        else:
+            unique_dims = []
+        
         # Sample data
         sample_docs = []
         for i, doc in enumerate(vector_store.documents[:3]):
@@ -1034,7 +1157,8 @@ async def debug_vector_store():
                 "source": doc.metadata.get("source"),
                 "chunk_id": doc.metadata.get("chunk_id"),
                 "content_preview": doc.page_content[:100] + "...",
-                "content_length": len(doc.page_content)
+                "content_length": len(doc.page_content),
+                "embedding_dimension": len(vector_store.embeddings_list[i]) if i < len(vector_store.embeddings_list) else None
             })
         
         info = {
@@ -1042,6 +1166,8 @@ async def debug_vector_store():
             "total_documents": len(vector_store.documents),
             "total_embeddings": len(vector_store.embeddings_list),
             "embeddings_match": len(vector_store.documents) == len(vector_store.embeddings_list),
+            "unique_embedding_dimensions": unique_dims,
+            "dimension_consistency": len(unique_dims) <= 1,
             "stats": stats,
             "sample_documents": sample_docs
         }
@@ -1049,6 +1175,10 @@ async def debug_vector_store():
         if vector_store.embeddings_list:
             info["embedding_dimension"] = len(vector_store.embeddings_list[0])
             info["embedding_dtype"] = str(vector_store.embeddings_list[0].dtype)
+        
+        # Warning if dimensions are inconsistent
+        if len(unique_dims) > 1:
+            info["warning"] = f"Inconsistent embedding dimensions detected: {unique_dims}. Please clear all documents and re-upload."
         
         logger.info(f"Vector store debug info: {info}")
         return info
@@ -1082,8 +1212,11 @@ if __name__ == "__main__":
     print(f"📊 Statistics: http://localhost:8000/stats")
     print(f"🔧 Debug Embeddings: http://localhost:8000/debug/embeddings")
     print(f"🔍 Debug Vector Store: http://localhost:8000/debug/vector-store")
+    print(f"🔄 Rebuild Vectors: POST http://localhost:8000/rebuild-vectors")
     print("=" * 80)
     print(f"📁 Upload Directory: {UPLOAD_DIR.absolute()}")
     print(f"💾 Data Directory: {DATA_DIR.absolute()}")
+    print("=" * 80)
+    print("💡 TIP: If you get embedding dimension errors, use /rebuild-vectors")
     print("=" * 80)
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
